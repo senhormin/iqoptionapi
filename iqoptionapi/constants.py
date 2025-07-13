@@ -2,6 +2,7 @@
 "Module for IQ Option API constants."
 ""#~~~need to update~~~
 ACTIVES = {
+    "EURUSD-op": 1861,
 	"EURUSD": 1,
 	"EURGBP": 2,
 	"GBPJPY": 3,
