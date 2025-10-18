@@ -302,17 +302,97 @@ class IQ_Option:
                             self.OPEN_TIME[option][name]["open"] = active["enabled"]    
 
     def __get_digital_open(self):
-        # for digital options
-        digital_data = self.get_digital_underlying_list_data()["underlying"]
-        for digital in digital_data:
-            name = digital["underlying"]
-            schedule = digital["schedule"]
-            self.OPEN_TIME["digital"][name]["open"] = False
-            for schedule_time in schedule:
-                start = schedule_time["open"]
-                end = schedule_time["close"]
-                if start < time.time() < end:
-                    self.OPEN_TIME["digital"][name]["open"] = True
+        raw_payload = self.get_digital_underlying_list_data()
+        digital_items = self._extract_digital_underlyings(raw_payload)
+
+        if digital_items:
+            for digital in digital_items:
+                name = digital.get("underlying") or digital.get("symbol")
+                self._update_digital_open_from_schedule(
+                    name=name,
+                    schedule=digital.get("schedule"),
+                    source="underlying-list",
+                )
+            return
+
+        logging.warning(
+            '**warning** falling back to get-instruments for digital schedule'
+        )
+        if self._populate_digital_open_from_instruments():
+            return
+
+        logging.error(
+            '**error** unexpected payload on get_digital_underlying_list_data: %s',
+            raw_payload if isinstance(raw_payload, dict) else type(raw_payload)
+        )
+
+    def _extract_digital_underlyings(self, payload):
+        if not isinstance(payload, dict):
+            return []
+
+        for key in ("underlying", "underlyings"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                return items
+
+        result = payload.get("result")
+        if isinstance(result, dict):
+            for key in ("underlying", "underlyings"):
+                items = result.get(key)
+                if isinstance(items, list):
+                    return items
+
+        return []
+
+    def _populate_digital_open_from_instruments(self):
+        try:
+            instruments_payload = self.get_instruments("digital-option")
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.error('**error** get_instruments digital-option failed: %s', exc)
+            return False
+
+        if not isinstance(instruments_payload, dict):
+            return False
+
+        instruments = instruments_payload.get("instruments") or []
+        if not instruments:
+            return False
+
+        for detail in instruments:
+            name = detail.get("name")
+            schedule = detail.get("schedule")
+            self._update_digital_open_from_schedule(
+                name=name,
+                schedule=schedule,
+                source="get-instruments",
+            )
+
+        logging.info(
+            'digital schedule populated from get-instruments (%d assets)',
+            len(instruments),
+        )
+        return True
+
+    def _update_digital_open_from_schedule(self, name, schedule, source):
+        if not name:
+            logging.debug('digital schedule without name, source=%s', source)
+            return
+
+        self.OPEN_TIME["digital"][name]["open"] = False
+        if not schedule:
+            logging.debug(
+                'empty schedule for digital asset %s (source=%s)', name, source
+            )
+            return
+
+        for schedule_time in schedule:
+            start = schedule_time.get("open") if isinstance(schedule_time, dict) else None
+            end = schedule_time.get("close") if isinstance(schedule_time, dict) else None
+            if start is None or end is None:
+                continue
+            if start < time.time() < end:
+                self.OPEN_TIME["digital"][name]["open"] = True
+                break
 
     def __get_other_open(self):
         # Crypto and etc pairs
@@ -945,16 +1025,37 @@ class IQ_Option:
 # __________________for Digital___________________
 
     def get_digital_underlying_list_data(self):
-        self.api.underlying_list_data = None
-        self.api.get_digital_underlying()
-        start_t = time.time()
-        while self.api.underlying_list_data == None:
-            if time.time() - start_t >= 30:
-                logging.error(
-                    '**warning** get_digital_underlying_list_data late 30 sec')
-                return None
+        versions_to_try = ("2.0", "3.0", "4.0", "1.0")
+        last_payload = {}
 
-        return self.api.underlying_list_data
+        for version in versions_to_try:
+            self.api.underlying_list_data = None
+            self.api.get_digital_underlying(version=version)
+            start_t = time.time()
+            while self.api.underlying_list_data is None:
+                if time.time() - start_t >= 30:
+                    logging.error(
+                        '**warning** get_digital_underlying_list_data late 30 sec (version %s)',
+                        version)
+                    break
+                time.sleep(0.1)
+
+            payload = self.api.underlying_list_data or {}
+            if self._extract_digital_underlyings(payload):
+                if version != versions_to_try[0]:
+                    logging.info(
+                        'get-underlying-list fallback succeeded with version %s',
+                        version)
+                return payload
+
+            message = payload.get("message") if isinstance(payload, dict) else None
+            if message:
+                logging.warning(
+                    'get-underlying-list %s responded with message: %s',
+                    version, message)
+            last_payload = payload
+
+        return last_payload
 
     def get_strike_list(self, ACTIVES, duration):
         self.api.strike_list = None
