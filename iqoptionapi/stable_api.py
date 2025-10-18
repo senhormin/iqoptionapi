@@ -315,14 +315,69 @@ class IQ_Option:
                 )
             return
 
-        logging.warning(
-            '**warning** falling back to get-instruments for digital schedule'
+        logging.info(
+            'falling back to top-assets for digital availability'
         )
-        if self._populate_digital_open_from_instruments():
+        collected_assets = []
+        for instrument in ("digital-option", "blitz-option"):
+            collected_assets.extend(self._collect_top_assets(instrument))
+
+        if collected_assets:
+            names_added = []
+            for asset in collected_assets:
+                name = (
+                    asset.get("underlying")
+                    or asset.get("symbol")
+                    or asset.get("name")
+                    or self._active_name_from_opcode(asset.get("active_id"))
+                    or self._active_name_from_opcode(asset.get("asset_id"))
+                )
+                if not name:
+                    continue
+
+                spot_profit = asset.get("spot_profit")
+                if isinstance(spot_profit, dict):
+                    is_open = bool(spot_profit.get("is_valid"))
+                else:
+                    is_open = None
+
+                if is_open is None:
+                    expiration = asset.get("expiration")
+                    if isinstance(expiration, dict):
+                        is_open = bool(expiration.get("is_valid"))
+
+                if is_open is None:
+                    is_enabled = asset.get("is_enabled", asset.get("enabled"))
+                    is_open = bool(is_enabled) if is_enabled is not None else False
+
+                is_suspended = asset.get("is_suspended", asset.get("is_trading_suspended"))
+                if bool(is_suspended):
+                    is_open = False
+
+                is_open = bool(is_open)
+
+                self.OPEN_TIME["digital"][name]["open"] = is_open
+                self.OPEN_TIME["digital"][name]["details"] = asset
+                names_added.append(name)
+
+            logging.info(
+                'digital availability populated from top-assets (%d assets)',
+                len(names_added),
+            )
+            if not names_added:
+                logging.warning(
+                    '**warning** top-assets payload without recognizable names: %s',
+                    collected_assets,
+                )
+            if self._populate_digital_open_from_instruments():
+                return
+            logging.debug(
+                'digital schedule not available via get-instruments; using top-assets fallback'
+            )
             return
 
         logging.error(
-            '**error** unexpected payload on get_digital_underlying_list_data: %s',
+            '**error** unexpected payload on get_digital_underlying_list_data and top-assets empty: %s',
             raw_payload if isinstance(raw_payload, dict) else type(raw_payload)
         )
 
@@ -762,6 +817,95 @@ class IQ_Option:
         else:
             return None
 
+    def _collect_top_assets(self, instrument_type, region_id=-1, timeout=10):
+        """Request a fresh top-assets payload and return the list of assets."""
+        instrument_type = str(instrument_type)
+        request_id = "top-assets-%s-%d" % (
+            instrument_type,
+            int(time.time() * 1000),
+        )
+
+        try:
+            self.unsubscribe_top_assets_updated(instrument_type)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        self.api.top_assets_updated_data.pop(instrument_type, None)
+
+        self.api.send_websocket_request(
+            name="sendMessage",
+            msg={
+                "name": "get-top-assets",
+                "version": "3.0",
+                "body": {"instrument_type": instrument_type, "region_id": region_id},
+            },
+            request_id=request_id,
+        )
+
+        self.subscribe_top_assets_updated(instrument_type)
+
+        start_t = time.time()
+        while instrument_type not in self.api.top_assets_updated_data:
+            if time.time() - start_t >= timeout:
+                logging.debug(
+                    'get-top-assets %s timeout after %s sec',
+                    instrument_type,
+                    timeout,
+                )
+                break
+            time.sleep(0.1)
+
+        try:
+            self.unsubscribe_top_assets_updated(instrument_type)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        data = self.api.top_assets_updated_data.get(instrument_type)
+        logging.debug(
+            'top-assets raw data for %s: %s',
+            instrument_type,
+            data,
+        )
+        if isinstance(data, dict):
+            for key in ("actives", "list", "assets"):
+                actives = data.get(key)
+                if isinstance(actives, list):
+                    return actives
+                if isinstance(actives, dict):
+                    return list(actives.values())
+        elif isinstance(data, list):
+            return data
+
+        return []
+
+    def _active_name_from_opcode(self, active_id):
+        if active_id is None:
+            return None
+        try:
+            active_id = int(active_id)
+        except (TypeError, ValueError):
+            return None
+
+        if not hasattr(self, "_active_id_name_cache"):
+            self._active_id_name_cache = {
+                int(value): key for key, value in OP_code.ACTIVES.items()
+                if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit())
+            }
+
+        name = self._active_id_name_cache.get(active_id)
+        if name:
+            return name
+
+        # Some ACTIVES store IDs as strings; try a relaxed search.
+        for key, value in OP_code.ACTIVES.items():
+            try:
+                if int(value) == active_id:
+                    self._active_id_name_cache[active_id] = key
+                    return key
+            except (TypeError, ValueError):
+                continue
+        return None
+
     # ------------------------commission_________
     # instrument_type: "binary-option"/"turbo-option"/"digital-option"/"crypto"/"forex"/"cfd"
     def subscribe_commission_changed(self, instrument_type):
@@ -1025,34 +1169,39 @@ class IQ_Option:
 # __________________for Digital___________________
 
     def get_digital_underlying_list_data(self):
-        versions_to_try = ("2.0", "3.0", "4.0", "1.0")
+        versions_to_try = ("2.0",)
         last_payload = {}
 
         for version in versions_to_try:
             self.api.underlying_list_data = None
             self.api.get_digital_underlying(version=version)
             start_t = time.time()
+            timeout = 10
             while self.api.underlying_list_data is None:
-                if time.time() - start_t >= 30:
-                    logging.error(
-                        '**warning** get_digital_underlying_list_data late 30 sec (version %s)',
-                        version)
+                if time.time() - start_t >= timeout:
+                    logging.debug(
+                        'get_digital_underlying_list_data timed out after %s sec (version %s)',
+                        timeout,
+                        version,
+                    )
                     break
                 time.sleep(0.1)
 
             payload = self.api.underlying_list_data or {}
             if self._extract_digital_underlyings(payload):
-                if version != versions_to_try[0]:
-                    logging.info(
-                        'get-underlying-list fallback succeeded with version %s',
-                        version)
                 return payload
 
             message = payload.get("message") if isinstance(payload, dict) else None
             if message:
-                logging.warning(
-                    'get-underlying-list %s responded with message: %s',
-                    version, message)
+                if not getattr(self, "_digital_underlying_warned", False):
+                    logging.info(
+                        'get-underlying-list %s responded with message: %s',
+                        version,
+                        message,
+                    )
+                    self._digital_underlying_warned = True
+                if isinstance(message, str) and "not supported" in message.lower():
+                    break
             last_payload = payload
 
         return last_payload
